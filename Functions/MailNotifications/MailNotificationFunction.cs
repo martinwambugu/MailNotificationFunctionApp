@@ -16,26 +16,49 @@ using System.Threading.Tasks;
 namespace MailNotificationFunctionApp.Functions.MailNotifications
 {
     /// <summary>  
-    /// Azure Function endpoint for receiving Microsoft Graph mail notifications and validation requests.  
+    /// Azure Function endpoint for receiving Microsoft Graph mail notifications and validation requests.  
     /// </summary>  
-    [OpenApiOperation(operationId: "MailNotification", tags: new[] { "MailNotifications" },
-        Summary = "Receive and process Microsoft Graph mail notifications.",
-        Description = "Handles Microsoft Graph webhook validation and mail notification payloads.")]
-    [OpenApiSecurity("ApiKeyAuth", SecuritySchemeType.ApiKey, Name = "x-api-key", In = OpenApiSecurityLocationType.Header)]
-    [OpenApiSecurity("BearerAuth", SecuritySchemeType.Http, Scheme = "bearer", BearerFormat = "JWT")]
-    [OpenApiRequestBody("application/json", typeof(GraphNotification), Description = "Graph notification payload.")]
-    [OpenApiResponseWithBody(HttpStatusCode.OK, "application/json", typeof(ValidationResponse), Description = "Validation or success response.")]
     public class MailNotificationFunction : BaseFunction
     {
         private readonly INotificationHandler _handler;
 
-        public MailNotificationFunction(INotificationHandler handler, ILogger<MailNotificationFunction> logger, ICustomTelemetry telemetry)
+        public MailNotificationFunction(
+            INotificationHandler handler,
+            ILogger<MailNotificationFunction> logger,
+            ICustomTelemetry telemetry)
             : base(logger, telemetry)
         {
             _handler = handler;
         }
 
+        /// <summary>  
+        /// Receives and processes Microsoft Graph mail notifications and validation requests.  
+        /// </summary>  
+        /// <param name="req">The HTTP request containing the notification payload or validation token.</param>  
+        /// <returns>HTTP response with validation token or success message.</returns>  
         [Function("MailNotification")]
+        [OpenApiOperation(
+            operationId: "MailNotification",
+            tags: new[] { "MailNotifications" },
+            Summary = "Receive and process Microsoft Graph mail notifications.",
+            Description = "Handles Microsoft Graph webhook validation and mail notification payloads.")]
+        [OpenApiSecurity(
+            "ApiKeyAuth",
+            SecuritySchemeType.ApiKey,
+            Name = "x-api-key",
+            In = OpenApiSecurityLocationType.Header)]
+        [OpenApiRequestBody(
+            "application/json",
+            typeof(GraphNotification),
+            Description = "Graph notification payload.")]
+        [OpenApiResponseWithBody(
+            HttpStatusCode.OK,
+            "application/json",
+            typeof(ValidationResponse),
+            Description = "Validation or success response.")]
+        [OpenApiResponseWithoutBody(
+            HttpStatusCode.InternalServerError,
+            Description = "Internal server error occurred.")]
         public async Task<HttpResponseData> Run(
             [HttpTrigger(AuthorizationLevel.Function, "post", Route = "notifications")] HttpRequestData req)
         {
@@ -43,6 +66,7 @@ namespace MailNotificationFunctionApp.Functions.MailNotifications
 
             try
             {
+                // Handle Microsoft Graph webhook validation  
                 var validationToken = System.Web.HttpUtility.ParseQueryString(req.Url.Query)["validationToken"];
                 if (!string.IsNullOrEmpty(validationToken))
                 {
@@ -53,6 +77,7 @@ namespace MailNotificationFunctionApp.Functions.MailNotifications
                     return resp;
                 }
 
+                // Process notification payload  
                 var rawBody = await new System.IO.StreamReader(req.Body).ReadToEndAsync();
                 _logger.LogInformation("📨 Notification payload received. Length={Length}", rawBody.Length);
 
