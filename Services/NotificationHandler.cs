@@ -11,18 +11,6 @@ using System.Threading.Tasks;
 
 namespace MailNotificationFunctionApp.Services
 {
-    /// <summary>  
-    /// Handles processing and persistence of mail notifications with security validation.  
-    /// </summary>  
-    /// <remarks>  
-    /// <para>  
-    /// This service validates incoming Microsoft Graph notifications by checking the client state  
-    /// against the stored value in the database, preventing webhook spoofing attacks.  
-    /// </para>  
-    /// <para>  
-    /// <b>Security:</b> Client state validation is CRITICAL for webhook security.  
-    /// </para>  
-    /// </remarks>  
     public class NotificationHandler : INotificationHandler
     {
         private readonly IEmailNotificationRepository _repo;
@@ -30,25 +18,24 @@ namespace MailNotificationFunctionApp.Services
         private readonly IConfiguration _config;
         private readonly ILogger<NotificationHandler> _logger;
         private readonly ICustomTelemetry _telemetry;
+        private readonly IMessageQueuePublisher _queuePublisher; // ✅ NEW  
 
-        /// <summary>  
-        /// Initializes a new instance of the <see cref="NotificationHandler"/> class.  
-        /// </summary>  
         public NotificationHandler(
             IEmailNotificationRepository repo,
             IDbConnectionFactory dbFactory,
             IConfiguration config,
             ILogger<NotificationHandler> logger,
-            ICustomTelemetry telemetry)
+            ICustomTelemetry telemetry,
+            IMessageQueuePublisher queuePublisher) // ✅ NEW  
         {
             _repo = repo ?? throw new ArgumentNullException(nameof(repo));
             _dbFactory = dbFactory ?? throw new ArgumentNullException(nameof(dbFactory));
             _config = config ?? throw new ArgumentNullException(nameof(config));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _telemetry = telemetry ?? throw new ArgumentNullException(nameof(telemetry));
+            _queuePublisher = queuePublisher ?? throw new ArgumentNullException(nameof(queuePublisher)); // ✅ NEW  
         }
 
-        /// <inheritdoc/>  
         public async Task<bool> HandleAsync(
             GraphNotification.ChangeNotification notification,
             string rawJson,
@@ -60,7 +47,6 @@ namespace MailNotificationFunctionApp.Services
                 "📬 Handling notification: SubscriptionId={SubscriptionId}, ChangeType={ChangeType}",
                 notification.SubscriptionId, notification.ChangeType);
 
-            // ✅ CRITICAL: Validate client state to prevent spoofing  
             if (!await ValidateClientStateAsync(notification, cancellationToken))
             {
                 _logger.LogWarning(
@@ -100,13 +86,40 @@ namespace MailNotificationFunctionApp.Services
 
             try
             {
-                // ✅ Pass cancellationToken to SaveNotificationAsync  
+                // ✅ Save notification to database  
                 await _repo.SaveNotificationAsync(entity, cancellationToken);
 
                 _telemetry.TrackEvent("MailNotification_Saved", new Dictionary<string, string>
                 {
                     { "NotificationId", entity.NotificationId }
                 });
+
+                // ✅ NEW: Extract userId and messageId from resource URI  
+                var (userId, messageId) = ExtractResourceDetails(notification.Resource);
+
+                // ✅ NEW: Publish to RabbitMQ  
+                var queueMessage = new NotificationQueueMessage
+                {
+                    NotificationId = entity.NotificationId,
+                    UserId = userId,
+                    MessageId = messageId,
+                    ChangeType = entity.ChangeType,
+                    SubscriptionId = entity.SubscriptionId,
+                    QueuedAt = DateTime.UtcNow
+                };
+
+                var published = await _queuePublisher.PublishNotificationAsync(queueMessage, cancellationToken);
+
+                if (!published)
+                {
+                    _logger.LogWarning(
+                        "⚠️ Failed to publish notification to queue: NotificationId={NotificationId}",
+                        entity.NotificationId);
+
+                    // ✅ Update status to indicate queue failure (non-critical)  
+                    entity.ProcessingStatus = "SavedButNotQueued";
+                    await _repo.SaveNotificationAsync(entity, cancellationToken);
+                }
 
                 return true;
             }
@@ -123,10 +136,8 @@ namespace MailNotificationFunctionApp.Services
                     { "NotificationId", entity.NotificationId }
                 });
 
-                // ✅ Try to save the failed notification for retry processing  
                 try
                 {
-                    // ✅ Pass cancellationToken here too  
                     await _repo.SaveNotificationAsync(entity, cancellationToken);
                 }
                 catch (Exception saveEx)
@@ -140,17 +151,47 @@ namespace MailNotificationFunctionApp.Services
         }
 
         /// <summary>  
-        /// Validates the client state from the notification against the stored value in the database.  
+        /// Extracts userId and messageId from Microsoft Graph resource URI.  
         /// </summary>  
         /// <remarks>  
-        /// <para>  
-        /// This is a critical security check to prevent webhook spoofing attacks.  
-        /// Microsoft Graph includes the client state value you provided when creating the subscription.  
-        /// </para>  
-        /// <para>  
-        /// <b>Timing Attack Prevention:</b> Uses constant-time string comparison to prevent timing attacks.  
-        /// </para>  
+        /// Example URI: "Users/{userId}/Messages/{messageId}"  
         /// </remarks>  
+        private (string userId, string messageId) ExtractResourceDetails(string? resourceUri)
+        {
+            if (string.IsNullOrWhiteSpace(resourceUri))
+            {
+                return ("unknown", "unknown");
+            }
+
+            try
+            {
+                // Example: "Users/john@contoso.com/Messages/AAMkAGI2..."  
+                var parts = resourceUri.Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+                var userId = "unknown";
+                var messageId = "unknown";
+
+                for (int i = 0; i < parts.Length; i++)
+                {
+                    if (parts[i].Equals("Users", StringComparison.OrdinalIgnoreCase) && i + 1 < parts.Length)
+                    {
+                        userId = parts[i + 1];
+                    }
+                    else if (parts[i].Equals("Messages", StringComparison.OrdinalIgnoreCase) && i + 1 < parts.Length)
+                    {
+                        messageId = parts[i + 1];
+                    }
+                }
+
+                return (userId, messageId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "⚠️ Failed to parse resource URI: {ResourceUri}", resourceUri);
+                return ("unknown", "unknown");
+            }
+        }
+
         private async Task<bool> ValidateClientStateAsync(
             GraphNotification.ChangeNotification notification,
             CancellationToken cancellationToken)
@@ -169,14 +210,12 @@ namespace MailNotificationFunctionApp.Services
 
             try
             {
-                // ✅ Retrieve the expected client state from the database  
                 const string sql = @"  
                     SELECT client_state   
                     FROM mail_subscriptions   
                     WHERE subscription_id = @SubscriptionId   
                     AND subscription_expiration_time > NOW();";
 
-                // ✅ Use 'using' instead of 'await using'  
                 using var conn = await _dbFactory.CreateConnectionAsync(cancellationToken);
 
                 var command = new CommandDefinition(
@@ -196,17 +235,13 @@ namespace MailNotificationFunctionApp.Services
                     return false;
                 }
 
-                // ✅ Constant-time comparison to prevent timing attacks  
                 var isValid = CryptographicEquals(notification.ClientState, expectedClientState);
 
                 if (!isValid)
                 {
                     _logger.LogWarning(
-                        "🚨 Client state mismatch for SubscriptionId: {SubscriptionId}. " +
-                        "Expected: {Expected}, Received: {Received}",
-                        notification.SubscriptionId,
-                        expectedClientState,
-                        notification.ClientState);
+                        "🚨 Client state mismatch for SubscriptionId: {SubscriptionId}",
+                        notification.SubscriptionId);
                 }
 
                 return isValid;
@@ -219,13 +254,6 @@ namespace MailNotificationFunctionApp.Services
             }
         }
 
-        /// <summary>  
-        /// Performs constant-time string comparison to prevent timing attacks.  
-        /// </summary>  
-        /// <remarks>  
-        /// This method compares two strings in constant time regardless of where differences occur,  
-        /// preventing attackers from using timing analysis to guess the expected value.  
-        /// </remarks>  
         private static bool CryptographicEquals(string a, string b)
         {
             if (a == null || b == null)

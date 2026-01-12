@@ -1,8 +1,9 @@
 ﻿using Azure.Monitor.OpenTelemetry.Exporter;
 using MailNotificationFunctionApp.Infrastructure;
 using MailNotificationFunctionApp.Interfaces;
-using MailNotificationFunctionApp.Services;
 using MailNotificationFunctionApp.Middleware;
+using MailNotificationFunctionApp.Models;
+using MailNotificationFunctionApp.Services;
 using Microsoft.ApplicationInsights;
 using Microsoft.Azure.Functions.Worker.Extensions.OpenApi.Extensions;
 using Microsoft.Azure.WebJobs.Extensions.OpenApi.Core.Abstractions;
@@ -42,7 +43,7 @@ var host = new HostBuilder()
             options.AddDefaultPolicy(policy =>
             {
                 policy
-                    .AllowAnyOrigin()  // Restrict in production if needed  
+                    .AllowAnyOrigin()
                     .AllowAnyMethod()
                     .AllowAnyHeader();
             });
@@ -54,8 +55,7 @@ var host = new HostBuilder()
         builder.Services.AddLogging(logging =>
         {
             logging.ClearProviders();
-            logging.AddConsole(); // ✅ Required for container/K8s logs  
-
+            logging.AddConsole();
             logging.AddOpenTelemetry(options =>
             {
                 options.IncludeScopes = true;
@@ -145,6 +145,13 @@ var host = new HostBuilder()
             builder.Services.AddSingleton<ICustomTelemetry, NoOpTelemetry>();
         }
 
+        // ✅ FIXED: Register RabbitMQ configuration using context.Configuration  
+        builder.Services.Configure<RabbitMqConfiguration>(
+            context.Configuration.GetSection("RabbitMq"));
+
+        // ✅ Register RabbitMQ publisher as singleton (connection pooling)  
+        builder.Services.AddSingleton<IMessageQueuePublisher, RabbitMqPublisher>();
+
         // -----------------------------------------------------  
         // Infrastructure Layer Registrations  
         // -----------------------------------------------------  
@@ -171,11 +178,9 @@ var host = new HostBuilder()
         // -----------------------------------------------------  
         builder.Services.AddSingleton<IOpenApiConfigurationOptions, OpenApiConfig>();
     })
-    // ✅ Ensure CORS middleware is active in Functions runtime  
     .ConfigureServices(services =>
     {
         services.AddCors();
-        // Add HttpClientFactory  
         services.AddHttpClient();
     })
     .ConfigureOpenApi()
