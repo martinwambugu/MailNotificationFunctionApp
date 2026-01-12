@@ -155,6 +155,7 @@ var host = new HostBuilder()
         // -----------------------------------------------------  
         builder.Services.AddScoped<IEmailNotificationRepository, EmailNotificationRepository>();
         builder.Services.AddScoped<INotificationHandler, NotificationHandler>();
+        builder.Services.AddScoped<NotificationRetryService>();
 
         // Add HttpClientFactory  
         builder.Services.AddHttpClient();

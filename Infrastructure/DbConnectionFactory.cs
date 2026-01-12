@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Data;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Npgsql;
@@ -8,52 +10,109 @@ using MailNotificationFunctionApp.Interfaces;
 namespace MailNotificationFunctionApp.Infrastructure
 {
     /// <summary>  
-    /// PostgreSQL implementation of <see cref="IDbConnectionFactory"/>.  
+    /// PostgreSQL implementation of <see cref="IDbConnectionFactory"/> with connection pooling.  
     /// </summary>  
-    /// <remarks>  
-    /// Retrieves the connection string from configuration and creates an un-opened <see cref="IDbConnection"/>.  
-    /// Logs connection creation events for diagnostics.  
-    /// </remarks>  
     public class DbConnectionFactory : IDbConnectionFactory
     {
-        private readonly IConfiguration _configuration;
+        private readonly string _connectionString;
         private readonly ILogger<DbConnectionFactory> _logger;
 
-        /// <summary>  
-        /// Initializes a new instance of the <see cref="DbConnectionFactory"/> class.  
-        /// </summary>  
-        /// <param name="configuration">Application configuration (used to retrieve the connection string).</param>  
-        /// <param name="logger">Logger for telemetry and diagnostics.</param>  
         public DbConnectionFactory(IConfiguration configuration, ILogger<DbConnectionFactory> logger)
         {
-            _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
-            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            ArgumentNullException.ThrowIfNull(configuration);
+            ArgumentNullException.ThrowIfNull(logger);
+
+            _logger = logger;
+
+            var connectionString = configuration.GetConnectionString("PostgreSqlConnection");
+
+            if (string.IsNullOrWhiteSpace(connectionString))
+            {
+                _logger.LogError("❌ Database connection string 'PostgreSqlConnection' is not configured.");
+                throw new InvalidOperationException(
+                    "Database connection string is not configured. " +
+                    "Please set it in appsettings.json, local.settings.json, or Azure Key Vault.");
+            }
+
+            // ✅ Configure connection pooling  
+            var builder = new NpgsqlConnectionStringBuilder(connectionString)
+            {
+                Pooling = true,
+                MinPoolSize = 5,
+                MaxPoolSize = 100,
+                ConnectionIdleLifetime = 300,
+                ConnectionPruningInterval = 10,
+                CommandTimeout = 30,
+                Timeout = 15,
+                NoResetOnClose = true,
+                MaxAutoPrepare = 20,
+                AutoPrepareMinUsages = 2,
+                KeepAlive = 30,
+                TcpKeepAlive = true,
+                TcpKeepAliveInterval = 10,
+                SslMode = SslMode.Require,
+                TrustServerCertificate = false // ✅ Validate certificates in production  
+            };
+
+            _connectionString = builder.ToString();
+
+            // ✅ Log sanitized connection string  
+            var safeConnString = $"Host={builder.Host};Port={builder.Port};Database={builder.Database};" +
+                                $"Username={builder.Username};Password=****;Pooling={builder.Pooling};" +
+                                $"MinPoolSize={builder.MinPoolSize};MaxPoolSize={builder.MaxPoolSize}";
+
+            _logger.LogInformation("📡 PostgreSQL connection factory initialized: {ConnectionString}", safeConnString);
         }
 
         /// <inheritdoc/>  
-        public IDbConnection CreateConnection()
+        public async Task<IDbConnection> CreateConnectionAsync(CancellationToken cancellationToken = default)
         {
-            var connectionString = _configuration.GetConnectionString("PostgreSqlConnection");
-            if (string.IsNullOrWhiteSpace(connectionString))
+            _logger.LogDebug("Creating new PostgreSQL connection from pool...");
+
+            NpgsqlConnection? connection = null;
+
+            try
             {
-                _logger.LogError("❌ Database connection string is not configured.");
-                throw new InvalidOperationException("Database connection string is not configured.");
+                connection = new NpgsqlConnection(_connectionString);
+
+                connection.StateChange += (sender, args) =>
+                {
+                    _logger.LogDebug(
+                        "🔌 Connection state changed: {OriginalState} → {CurrentState}",
+                        args.OriginalState, args.CurrentState);
+                };
+
+                await connection.OpenAsync(cancellationToken);
+
+                _logger.LogDebug("✅ PostgreSQL connection opened. State: {State}", connection.State);
+
+                return connection;
             }
-
-            // Mask password before logging  
-            var safeConn = connectionString.Replace(
-                new NpgsqlConnectionStringBuilder(connectionString).Password, "****");
-
-            _logger.LogInformation("📡 Creating new PostgreSQL connection to: {Conn}", safeConn);
-            var conn = new NpgsqlConnection(connectionString);
-
-            // Optional: log when connection is opened  
-            conn.StateChange += (sender, args) =>
+            catch (NpgsqlException npgEx)
             {
-                _logger.LogInformation("🔌 DB Connection state changed: {Old} -> {New}", args.OriginalState, args.CurrentState);
-            };
+                _logger.LogError(
+                    npgEx,
+                    "❌ Failed to open PostgreSQL connection. Error Code: {ErrorCode}, SQL State: {SqlState}",
+                    npgEx.ErrorCode, npgEx.SqlState);
 
-            return conn;
+                connection?.Dispose();
+
+                throw new InvalidOperationException(
+                    $"Failed to connect to PostgreSQL database. Error: {npgEx.Message}",
+                    npgEx);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning("⚠️ Connection opening was cancelled.");
+                connection?.Dispose();
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Unexpected error while opening database connection.");
+                connection?.Dispose();
+                throw;
+            }
         }
     }
 }
