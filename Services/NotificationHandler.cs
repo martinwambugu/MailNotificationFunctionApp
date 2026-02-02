@@ -18,7 +18,7 @@ namespace MailNotificationFunctionApp.Services
         private readonly IConfiguration _config;
         private readonly ILogger<NotificationHandler> _logger;
         private readonly ICustomTelemetry _telemetry;
-        private readonly IMessageQueuePublisher _queuePublisher; // ✅ NEW  
+        private readonly IMessageQueuePublisher _queuePublisher; 
 
         public NotificationHandler(
             IEmailNotificationRepository repo,
@@ -26,7 +26,7 @@ namespace MailNotificationFunctionApp.Services
             IConfiguration config,
             ILogger<NotificationHandler> logger,
             ICustomTelemetry telemetry,
-            IMessageQueuePublisher queuePublisher) // ✅ NEW  
+            IMessageQueuePublisher queuePublisher) 
         {
             _repo = repo ?? throw new ArgumentNullException(nameof(repo));
             _dbFactory = dbFactory ?? throw new ArgumentNullException(nameof(dbFactory));

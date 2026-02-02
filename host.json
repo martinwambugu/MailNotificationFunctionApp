@@ -13,19 +13,19 @@
       },
       "enableLiveMetricsFilters": true
     }
-  },
-
-  "RabbitMq": {
-    "HostName": "localhost",
-    "Port": 5672,
-    "UserName": "guest",
-    "Password": "guest",
-    "VirtualHost": "/",
-    "QueueName": "email-notifications",
-    "ExchangeName": "email-notifications-exchange",
-    "RoutingKey": "notification.email",
-    "Durable": true,
-    "ConnectionTimeoutSeconds": 30,
-    "PublishTimeoutSeconds": 10
   }
+
+  //"RabbitMq": {
+  //  "HostName": "localhost",
+  //  "Port": 5672,
+  //  "UserName": "guest",
+  //  "Password": "guest",
+  //  "VirtualHost": "/",
+  //  "QueueName": "email-notifications",
+  //  "ExchangeName": "email-notifications-exchange",
+  //  "RoutingKey": "notification.email",
+  //  "Durable": true,
+  //  "ConnectionTimeoutSeconds": 30,
+  //  "PublishTimeoutSeconds": 10
+  //}
 }

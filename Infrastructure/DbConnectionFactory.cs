@@ -47,9 +47,9 @@ namespace MailNotificationFunctionApp.Infrastructure
                 NoResetOnClose = true,
                 MaxAutoPrepare = 20,
                 AutoPrepareMinUsages = 2,
-                KeepAlive = 30,
-                TcpKeepAlive = true,
-                TcpKeepAliveInterval = 10,
+                //KeepAlive = 30,
+                //TcpKeepAlive = true,
+                //TcpKeepAliveInterval = 10,
                 SslMode = SslMode.Require,
                 TrustServerCertificate = false // ✅ Validate certificates in production  
             };
