@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Threading.Tasks;
@@ -13,7 +14,11 @@ namespace MailNotificationFunctionApp.Middleware
     /// <summary>  
     /// API Key authentication middleware for Azure Functions Isolated Worker.  
     /// Checks for a configured static API key in request headers.  
-    /// Skips authentication for Swagger/OpenAPI documentation endpoints.  
+    /// Skips authentication for:  
+    /// <list type="bullet">  
+    ///     <item>Swagger/OpenAPI documentation endpoints</item>  
+    ///     <item>Microsoft Graph webhook validation requests (with validationToken query parameter)</item>  
+    /// </list>  
     /// </summary>  
     public class ApiKeyAuthMiddleware : IFunctionsWorkerMiddleware
     {
@@ -39,6 +44,23 @@ namespace MailNotificationFunctionApp.Middleware
 
             var path = req.Url.AbsolutePath?.ToLowerInvariant() ?? string.Empty;
 
+            // ✅ CRITICAL: Bypass API key validation for Microsoft Graph webhook validation  
+            // Microsoft Graph sends GET requests with ?validationToken parameter during subscription creation  
+            // These requests do NOT include custom headers like x-api-key  
+            var query = req.Url.Query;
+            if (!string.IsNullOrEmpty(query))
+            {
+                var validationToken = System.Web.HttpUtility.ParseQueryString(query)["validationToken"];
+                if (!string.IsNullOrEmpty(validationToken))
+                {
+                    _logger.LogInformation(
+                        "🔓 Bypassing API key check for Microsoft Graph validation request. Token: {Token}",
+                        validationToken);
+                    await next(context);
+                    return;
+                }
+            }
+
             // ✅ Skip authentication for Swagger/OpenAPI endpoints  
             if (path.Contains("swagger", StringComparison.OrdinalIgnoreCase) ||
                 path.Contains("openapi", StringComparison.OrdinalIgnoreCase) ||
@@ -53,17 +75,19 @@ namespace MailNotificationFunctionApp.Middleware
             var authMode = _config["Auth:Mode"] ?? _config["Auth__Mode"];
             if (!string.Equals(authMode, "apikey", StringComparison.OrdinalIgnoreCase))
             {
-                _logger.LogWarning("Auth:Mode is not set to 'apikey' (current value: '{AuthMode}'). API key authentication skipped.", authMode);
+                _logger.LogWarning(
+                    "Auth:Mode is not set to 'apikey' (current value: '{AuthMode}'). API key authentication skipped.",
+                    authMode);
                 await next(context);
                 return;
             }
 
             // ✅ Load expected API key from configuration (support both : and __ for Azure)  
             var expectedKey = _config["Auth:ApiKey"] ?? _config["Auth__ApiKey"];
-
             if (string.IsNullOrWhiteSpace(expectedKey))
             {
-                _logger.LogError("❌ API key is not configured. Set 'Auth__ApiKey' in Azure App Settings or 'Auth:ApiKey' in local.settings.json.");
+                _logger.LogError(
+                    "❌ API key is not configured. Set 'Auth__ApiKey' in Azure App Settings or 'Auth:ApiKey' in local.settings.json.");
                 await WriteUnauthorizedAsync(context, "Server authentication configuration error.");
                 return;
             }
