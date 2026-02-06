@@ -5,21 +5,25 @@ using System.Threading.Tasks;
 namespace MailNotificationFunctionApp.Interfaces
 {
     /// <summary>  
-    /// Handles business logic for processing Microsoft Graph change notifications.  
+    /// Defines the contract for processing email notifications from Microsoft Graph.  
     /// </summary>  
     public interface INotificationHandler
     {
         /// <summary>  
-        /// Validates and processes a single Graph notification item.  
+        /// Processes a single notification item.  
         /// </summary>  
-        /// <param name="notification">Graph change notification item.</param>  
-        /// <param name="rawJson">Raw JSON payload for telemetry reference.</param>  
+        /// <param name="item">The notification item to process.</param>  
+        /// <param name="rawPayload">The original raw JSON payload from Microsoft Graph.</param>  
         /// <param name="cancellationToken">Cancellation token.</param>  
-        /// <returns>True if validation and processing succeeded, false otherwise.</returns>  
-        /// <exception cref="SecurityException">Thrown when client state validation fails.</exception>  
+        /// <returns>  
+        /// <c>true</c> if processing succeeded; <c>false</c> if processing failed but should be retried.  
+        /// </returns>  
+        /// <exception cref="System.Security.SecurityException">  
+        /// Thrown when client state validation fails (spoofing attempt detected).  
+        /// </exception>  
         Task<bool> HandleAsync(
-            GraphNotification.ChangeNotification notification,
-            string rawJson,
+            NotificationItem item,
+            string rawPayload,
             CancellationToken cancellationToken = default);
     }
 }

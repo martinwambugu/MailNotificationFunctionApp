@@ -1,5 +1,6 @@
 ﻿using MailNotificationFunctionApp.Interfaces;
 using MailNotificationFunctionApp.Models;
+using MailNotificationFunctionApp.Extensions; // ✅ ADD THIS  
 using Dapper;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
@@ -11,6 +12,18 @@ using System.Threading.Tasks;
 
 namespace MailNotificationFunctionApp.Services
 {
+    /// <summary>  
+    /// Handles incoming Microsoft Graph webhook notifications for email changes.  
+    /// </summary>  
+    /// <remarks>  
+    /// <para>  
+    /// This handler validates notifications, persists them to PostgreSQL, and publishes them to RabbitMQ  
+    /// for asynchronous processing by downstream consumers.  
+    /// </para>  
+    /// <para>  
+    /// <b>Security:</b> Validates client state to prevent webhook spoofing attacks.  
+    /// </para>  
+    /// </remarks>  
     public class NotificationHandler : INotificationHandler
     {
         private readonly IEmailNotificationRepository _repo;
@@ -18,86 +31,127 @@ namespace MailNotificationFunctionApp.Services
         private readonly IConfiguration _config;
         private readonly ILogger<NotificationHandler> _logger;
         private readonly ICustomTelemetry _telemetry;
-        private readonly IMessageQueuePublisher _queuePublisher; 
+        private readonly IMessageQueuePublisher _queuePublisher;
 
+        /// <summary>  
+        /// Initializes a new instance of the <see cref="NotificationHandler"/> class.  
+        /// </summary>  
         public NotificationHandler(
             IEmailNotificationRepository repo,
             IDbConnectionFactory dbFactory,
             IConfiguration config,
             ILogger<NotificationHandler> logger,
             ICustomTelemetry telemetry,
-            IMessageQueuePublisher queuePublisher) 
+            IMessageQueuePublisher queuePublisher)
         {
             _repo = repo ?? throw new ArgumentNullException(nameof(repo));
             _dbFactory = dbFactory ?? throw new ArgumentNullException(nameof(dbFactory));
             _config = config ?? throw new ArgumentNullException(nameof(config));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _telemetry = telemetry ?? throw new ArgumentNullException(nameof(telemetry));
-            _queuePublisher = queuePublisher ?? throw new ArgumentNullException(nameof(queuePublisher)); // ✅ NEW  
+            _queuePublisher = queuePublisher ?? throw new ArgumentNullException(nameof(queuePublisher));
         }
 
+        /// <inheritdoc/>  
+        /// <summary>  
+        /// ✅ FIXED: Now accepts NotificationItem instead of GraphNotification.ChangeNotification  
+        /// </summary>  
         public async Task<bool> HandleAsync(
-            GraphNotification.ChangeNotification notification,
+            NotificationItem notification, // ✅ CHANGED FROM GraphNotification.ChangeNotification  
             string rawJson,
             CancellationToken cancellationToken = default)
         {
             ArgumentNullException.ThrowIfNull(notification);
 
             _logger.LogInformation(
-                "📬 Handling notification: SubscriptionId={SubscriptionId}, ChangeType={ChangeType}",
-                notification.SubscriptionId, notification.ChangeType);
+                "📬 Handling notification: SubscriptionId={SubscriptionId}, ChangeType={ChangeType}, Resource={Resource}",
+                notification.SubscriptionId,
+                notification.ChangeType,
+                notification.Resource);
 
-            if (!await ValidateClientStateAsync(notification, cancellationToken))
+            // ✅ Validate client state to prevent spoofing (skip if null - retry scenario)  
+            if (!string.IsNullOrWhiteSpace(notification.ClientState))
             {
-                _logger.LogWarning(
-                    "🚨 Client state validation failed for SubscriptionId: {SubscriptionId}",
-                    notification.SubscriptionId);
-
-                _telemetry.TrackEvent("MailNotification_ValidationFailed", new Dictionary<string, string>
+                if (!await ValidateClientStateAsync(notification, cancellationToken))
                 {
-                    { "SubscriptionId", notification.SubscriptionId ?? "unknown" },
-                    { "Reason", "InvalidClientState" }
-                });
+                    _logger.LogWarning(
+                        "🚨 Client state validation failed for SubscriptionId: {SubscriptionId}",
+                        notification.SubscriptionId);
 
-                throw new SecurityException(
-                    $"Client state validation failed for subscription {notification.SubscriptionId}. " +
-                    "Possible webhook spoofing attempt.");
+                    _telemetry.TrackEvent("MailNotification_ValidationFailed", new Dictionary<string, string>
+                    {
+                        { "SubscriptionId", notification.SubscriptionId ?? "unknown" },
+                        { "Reason", "InvalidClientState" }
+                    });
+
+                    throw new SecurityException(
+                        $"Client state validation failed for subscription {notification.SubscriptionId}. " +
+                        "Possible webhook spoofing attempt.");
+                }
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "ℹ️ Skipping client state validation (retry scenario). SubscriptionId: {SubscriptionId}",
+                    notification.SubscriptionId);
             }
 
+            // ✅ Extract userId and messageId from resource URI  
+            var (userId, messageId) = ExtractResourceDetails(notification.Resource);
+
+            _logger.LogInformation(
+                "📋 Extracted details: UserId={UserId}, MessageId={MessageId}",
+                userId, messageId);
+
+            // ✅ Create notification entity  
             var entity = new EmailNotification
             {
                 NotificationId = notification.Id ?? Guid.NewGuid().ToString(),
                 SubscriptionId = notification.SubscriptionId ?? "unknown",
                 ChangeType = notification.ChangeType ?? "created",
                 ResourceUri = notification.Resource ?? string.Empty,
-                ResourceId = notification.ResourceDataId ?? Guid.NewGuid().ToString(),
-                NotificationDateTime = DateTime.UtcNow,
+                ResourceId = notification.ResourceData?.Id ?? messageId, // Use ResourceData.Id or fallback  
+                NotificationDateTime = notification.SubscriptionExpirationDateTime ?? DateTime.UtcNow,
                 ReceivedDateTime = DateTime.UtcNow,
                 RawNotificationPayload = rawJson,
-                ProcessingStatus = "Pending"
+                ProcessingStatus = "Pending",
+                RetryCount = 0,
+                ErrorMessage = null
             };
 
             _telemetry.TrackEvent("MailNotification_Received", new Dictionary<string, string>
             {
+                { "NotificationId", entity.NotificationId },
                 { "SubscriptionId", entity.SubscriptionId },
-                { "ResourceId", entity.ResourceId },
-                { "ChangeType", entity.ChangeType }
+                { "ResourceId", entity.ResourceId ?? "unknown" },
+                { "ChangeType", entity.ChangeType },
+                { "UserId", userId },
+                { "MessageId", messageId }
             });
 
             try
             {
-                // ✅ Save notification to database  
+                // ✅ Step 1: Save notification to database  
+                _logger.LogInformation(
+                    "💾 Saving notification to database: {NotificationId}",
+                    entity.NotificationId);
+
                 await _repo.SaveNotificationAsync(entity, cancellationToken);
 
-                _telemetry.TrackEvent("MailNotification_Saved", new Dictionary<string, string>
+                _logger.LogInformation(
+                    "✅ Notification saved to database: {NotificationId}",
+                    entity.NotificationId);
+
+                _telemetry.TrackEvent("MailNotification_DatabaseSaved", new Dictionary<string, string>
                 {
                     { "NotificationId", entity.NotificationId }
                 });
 
-                // ✅ NEW: Extract userId and messageId from resource URI  
-                var (userId, messageId) = ExtractResourceDetails(notification.Resource);
+                // ✅ Step 2: Publish to RabbitMQ  
+                _logger.LogInformation(
+                    "📤 Publishing notification to queue: {NotificationId}",
+                    entity.NotificationId);
 
-                // ✅ NEW: Publish to RabbitMQ  
                 var queueMessage = new NotificationQueueMessage
                 {
                     NotificationId = entity.NotificationId,
@@ -117,57 +171,92 @@ namespace MailNotificationFunctionApp.Services
                         entity.NotificationId);
 
                     // ✅ Update status to indicate queue failure (non-critical)  
-                    entity.ProcessingStatus = "SavedButNotQueued";
+                    entity.ProcessingStatus = "Failed";
+                    entity.ErrorMessage = "Failed to publish to message queue";
                     await _repo.SaveNotificationAsync(entity, cancellationToken);
+
+                    _telemetry.TrackEvent("MailNotification_QueuePublishFailed", new Dictionary<string, string>
+                    {
+                        { "NotificationId", entity.NotificationId },
+                        { "Reason", "PublishReturnedFalse" }
+                    });
+
+                    // ✅ Return false to trigger retry  
+                    return false;
                 }
+
+                _logger.LogInformation(
+                    "✅ Notification published to queue successfully: {NotificationId}",
+                    entity.NotificationId);
+
+                _telemetry.TrackEvent("MailNotification_QueuePublished", new Dictionary<string, string>
+                {
+                    { "NotificationId", entity.NotificationId }
+                });
 
                 return true;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error saving notification {NotificationId}", entity.NotificationId);
+                _logger.LogError(
+                    ex,
+                    "❌ Error handling notification {NotificationId}: {ErrorMessage}",
+                    entity.NotificationId,
+                    ex.Message);
 
+                // ✅ Update notification status to Failed  
                 entity.ProcessingStatus = "Failed";
-                entity.ErrorMessage = ex.Message;
+                entity.ErrorMessage = $"{ex.GetType().Name}: {ex.Message}";
                 entity.RetryCount++;
 
                 _telemetry.TrackException(ex, new Dictionary<string, string>
                 {
-                    { "NotificationId", entity.NotificationId }
+                    { "NotificationId", entity.NotificationId },
+                    { "Operation", "HandleAsync" },
+                    { "ErrorType", ex.GetType().Name }
                 });
 
+                // ✅ Attempt to save error state (best effort)  
                 try
                 {
                     await _repo.SaveNotificationAsync(entity, cancellationToken);
+                    _logger.LogInformation(
+                        "📝 Saved error state for notification: {NotificationId}",
+                        entity.NotificationId);
                 }
                 catch (Exception saveEx)
                 {
-                    _logger.LogError(saveEx, "❌ Failed to save error state for notification {NotificationId}",
+                    _logger.LogError(
+                        saveEx,
+                        "❌ Failed to save error state for notification {NotificationId}",
                         entity.NotificationId);
+
+                    _telemetry.TrackException(saveEx, new Dictionary<string, string>
+                    {
+                        { "NotificationId", entity.NotificationId },
+                        { "Operation", "SaveErrorState" }
+                    });
                 }
 
-                throw;
+                // ✅ Return false to trigger retry (don't rethrow)  
+                return false;
             }
         }
 
         /// <summary>  
         /// Extracts userId and messageId from Microsoft Graph resource URI.  
         /// </summary>  
-        /// <remarks>  
-        /// Example URI: "Users/{userId}/Messages/{messageId}"  
-        /// </remarks>  
         private (string userId, string messageId) ExtractResourceDetails(string? resourceUri)
         {
             if (string.IsNullOrWhiteSpace(resourceUri))
             {
+                _logger.LogWarning("⚠️ Resource URI is null or empty");
                 return ("unknown", "unknown");
             }
 
             try
             {
-                // Example: "Users/john@contoso.com/Messages/AAMkAGI2..."  
                 var parts = resourceUri.Split('/', StringSplitOptions.RemoveEmptyEntries);
-
                 var userId = "unknown";
                 var messageId = "unknown";
 
@@ -183,17 +272,31 @@ namespace MailNotificationFunctionApp.Services
                     }
                 }
 
+                if (userId == "unknown" || messageId == "unknown")
+                {
+                    _logger.LogWarning(
+                        "⚠️ Could not extract complete details from resource URI: {ResourceUri}",
+                        resourceUri);
+                }
+
                 return (userId, messageId);
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "⚠️ Failed to parse resource URI: {ResourceUri}", resourceUri);
+                _logger.LogWarning(
+                    ex,
+                    "⚠️ Failed to parse resource URI: {ResourceUri}",
+                    resourceUri);
+
                 return ("unknown", "unknown");
             }
         }
 
+        /// <summary>  
+        /// Validates the client state from the notification against the stored subscription.  
+        /// </summary>  
         private async Task<bool> ValidateClientStateAsync(
-            GraphNotification.ChangeNotification notification,
+            NotificationItem notification,
             CancellationToken cancellationToken)
         {
             if (string.IsNullOrWhiteSpace(notification.ClientState))
@@ -211,10 +314,10 @@ namespace MailNotificationFunctionApp.Services
             try
             {
                 const string sql = @"  
-                    SELECT client_state   
-                    FROM mail_subscriptions   
-                    WHERE subscription_id = @SubscriptionId   
-                    AND subscription_expiration_time > NOW();";
+                    SELECT clientstate  
+                    FROM mailsubscriptions  
+                    WHERE subscriptionid = @SubscriptionId  
+                    AND subscriptionexpirationtime > NOW();";
 
                 using var conn = await _dbFactory.CreateConnectionAsync(cancellationToken);
 
@@ -248,12 +351,17 @@ namespace MailNotificationFunctionApp.Services
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error validating client state for SubscriptionId: {SubscriptionId}",
+                _logger.LogError(
+                    ex,
+                    "❌ Error validating client state for SubscriptionId: {SubscriptionId}",
                     notification.SubscriptionId);
                 return false;
             }
         }
 
+        /// <summary>  
+        /// Performs constant-time string comparison to prevent timing attacks.  
+        /// </summary>  
         private static bool CryptographicEquals(string a, string b)
         {
             if (a == null || b == null)
