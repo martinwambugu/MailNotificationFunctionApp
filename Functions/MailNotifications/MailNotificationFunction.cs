@@ -1,4 +1,5 @@
-﻿using MailNotificationFunctionApp.Infrastructure;
+﻿using MailNotificationFunctionApp.Extensions;
+using MailNotificationFunctionApp.Infrastructure;
 using MailNotificationFunctionApp.Interfaces;
 using MailNotificationFunctionApp.Models;
 using Microsoft.Azure.Functions.Worker;
@@ -19,23 +20,35 @@ using System.Threading.Tasks;
 namespace MailNotificationFunctionApp.Functions.MailNotifications
 {
     /// <summary>  
-    /// Azure Function endpoint for receiving Microsoft Graph mail notifications and validation requests.  
+    /// Azure Function endpoint for receiving Microsoft Graph mail notifications.  
     /// </summary>  
     /// <remarks>  
     /// <para>  
-    /// This function handles two types of requests:  
+    /// <b>Security Model:</b>  
+    /// Microsoft Graph webhooks use client state validation instead of API keys.  
+    /// Each notification includes a clientState field that must match the value  
+    /// set during subscription creation. This proves authenticity without requiring  
+    /// Microsoft to send authentication headers.  
+    /// </para>  
+    /// <para>  
+    /// <b>Request Types:</b>  
     /// <list type="number">  
-    ///     <item><b>Validation Requests (GET):</b> Microsoft Graph sends a validation token during subscription creation.</item>  
-    ///     <item><b>Change Notifications (POST):</b> Actual webhook notifications when mailbox events occur.</item>  
+    ///     <item><b>Validation (GET/POST with validationToken):</b> One-time validation during subscription creation.</item>  
+    ///     <item><b>Notifications (POST):</b> Webhook notifications when mailbox events occur.</item>  
     /// </list>  
     /// </para>  
     /// <para>  
-    /// <b>Security:</b> All notifications are validated using the client state value to prevent spoofing attacks.  
+    /// <b>Security Features:</b>  
+    /// - Client state validation (prevents spoofing)  
+    /// - Request size limits (prevents DoS)  
+    /// - Idempotency checks (prevents duplicate processing)  
+    /// - HTTPS enforcement (Azure Functions requirement)  
     /// </para>  
     /// </remarks>  
     public class MailNotificationFunction : BaseFunction
     {
         private readonly INotificationHandler _handler;
+        private const long MaxRequestSizeBytes = 1 * 1024 * 1024; // 1MB  
 
         public MailNotificationFunction(
             INotificationHandler handler,
@@ -47,19 +60,29 @@ namespace MailNotificationFunctionApp.Functions.MailNotifications
         }
 
         /// <summary>  
-        /// Receives and processes Microsoft Graph mail notifications and validation requests.  
+        /// Receives and processes Microsoft Graph mail notifications with client state validation.  
         /// </summary>  
+        /// <remarks>  
+        /// <para>  
+        /// <b>Authentication:</b> Uses AuthorizationLevel.Anonymous because Microsoft Graph  
+        /// does not send API keys. Security is enforced through client state validation  
+        /// (comparing notification.clientState with stored subscription.clientState).  
+        /// </para>  
+        /// <para>  
+        /// <b>Endpoint Protection:</b>   
+        /// - HTTPS is enforced by Azure Functions (HTTP not allowed)  
+        /// - Request size limits prevent DoS attacks  
+        /// - Client state validation prevents spoofing  
+        /// - Idempotency checks prevent duplicate processing  
+        /// </para>  
+        /// </remarks>  
         [Function("MailNotification")]
         [OpenApiOperation(
             operationId: "MailNotification",
             tags: new[] { "MailNotifications" },
             Summary = "Receive and process Microsoft Graph mail notifications.",
-            Description = "Handles Microsoft Graph webhook validation (GET) and mail notification payloads (POST) with client state validation.")]
-        [OpenApiSecurity(
-            "ApiKeyAuth",
-            SecuritySchemeType.ApiKey,
-            Name = "x-api-key",
-            In = OpenApiSecurityLocationType.Header)]
+            Description = "Handles Microsoft Graph webhook validation (GET) and mail notification payloads (POST) with client state validation. " +
+                         "No API key required - Microsoft Graph uses client state validation for security.")]
         [OpenApiRequestBody(
             "application/json",
             typeof(GraphNotification),
@@ -71,7 +94,10 @@ namespace MailNotificationFunctionApp.Functions.MailNotifications
             Description = "Validation token (GET) or success response (POST).")]
         [OpenApiResponseWithoutBody(
             HttpStatusCode.Unauthorized,
-            Description = "Client state validation failed.")]
+            Description = "Client state validation failed (spoofing attempt detected).")]
+        [OpenApiResponseWithoutBody(
+            HttpStatusCode.BadRequest,
+            Description = "Invalid request format or missing required fields.")]
         [OpenApiResponseWithoutBody(
             HttpStatusCode.InternalServerError,
             Description = "Internal server error occurred.")]
@@ -80,18 +106,33 @@ namespace MailNotificationFunctionApp.Functions.MailNotifications
             HttpRequestData req,
             CancellationToken cancellationToken)
         {
-            LogStart(nameof(MailNotificationFunction));
+            // ✅ Generate correlation ID for request tracking  
+            var correlationId = req.Headers.TryGetValues("X-Correlation-ID", out var corrIds)
+                ? corrIds.FirstOrDefault()
+                : Guid.NewGuid().ToString();
 
-            try
+            using (_logger.BeginScope(new Dictionary<string, object>
             {
-                // ✅ Handle Microsoft Graph webhook validation (GET request with validationToken)  
-                if (req.Method.Equals("GET", StringComparison.OrdinalIgnoreCase))
-                {
-                    var validationToken = System.Web.HttpUtility.ParseQueryString(req.Url.Query)["validationToken"];
+                ["CorrelationId"] = correlationId,
+                ["RequestMethod"] = req.Method,
+                ["RequestPath"] = req.Url.AbsolutePath,
+                ["RemoteIp"] = req.Headers.TryGetValues("X-Forwarded-For", out var ips)
+                    ? ips.FirstOrDefault()
+                    : "unknown"
+            }))
+            {
+                LogStart(nameof(MailNotificationFunction));
 
+                try
+                {
+                    // ✅ Handle Microsoft Graph webhook validation (GET or POST with validationToken)  
+                    var validationToken = System.Web.HttpUtility.ParseQueryString(req.Url.Query)["validationToken"];
                     if (!string.IsNullOrEmpty(validationToken))
                     {
-                        _logger.LogInformation("🔑 Validation token received via GET: {Token}", validationToken);
+                        _logger.LogInformation(
+                            "🔑 Validation token received via {Method}: {Token}",
+                            req.Method,
+                            validationToken);
 
                         var resp = req.CreateResponse(HttpStatusCode.OK);
                         resp.Headers.Add("Content-Type", "text/plain; charset=utf-8");
@@ -99,142 +140,339 @@ namespace MailNotificationFunctionApp.Functions.MailNotifications
 
                         _telemetry.TrackEvent("MailNotification_ValidationTokenReturned", new Dictionary<string, string>
                         {
-                            { "Token", validationToken },
-                            { "Method", "GET" }
+                            { "CorrelationId", correlationId },
+                            { "Method", req.Method },
+                            { "TokenLength", validationToken.Length.ToString() }
                         });
 
-                        _logger.LogInformation("✅ Validation token echoed back to Microsoft Graph");
-                        LogEnd(nameof(MailNotificationFunction), new { validationToken, method = "GET" });
+                        _logger.LogInformation(
+                            "✅ Validation token echoed back to Microsoft Graph. CorrelationId: {CorrelationId}",
+                            correlationId);
+
+                        LogEnd(nameof(MailNotificationFunction), new { validationToken, method = req.Method });
                         return resp;
                     }
-                    else
+
+                    // ✅ Handle POST requests (actual notifications)  
+                    if (!req.Method.Equals("POST", StringComparison.OrdinalIgnoreCase))
                     {
-                        _logger.LogWarning("⚠️ GET request received without validationToken");
-                        return await BadRequest(req, "Missing validationToken query parameter");
+                        _logger.LogWarning(
+                            "⚠️ Unsupported HTTP method: {Method}. CorrelationId: {CorrelationId}",
+                            req.Method,
+                            correlationId);
+
+                        return await BadRequest(req, $"Unsupported HTTP method: {req.Method}. Expected POST or GET with validationToken.");
                     }
-                }
 
-                // ✅ Handle POST requests (actual notifications)  
-                if (req.Method.Equals("POST", StringComparison.OrdinalIgnoreCase))
-                {
-                    // ✅ Also check for validationToken in POST (some implementations send it via POST)  
-                    var validationToken = System.Web.HttpUtility.ParseQueryString(req.Url.Query)["validationToken"];
-                    if (!string.IsNullOrEmpty(validationToken))
+                    // ✅ Validate Content-Length to prevent DoS attacks  
+                    if (req.Headers.TryGetValues("Content-Length", out var contentLengthValues))
                     {
-                        _logger.LogInformation("🔑 Validation token received via POST: {Token}", validationToken);
-
-                        var resp = req.CreateResponse(HttpStatusCode.OK);
-                        resp.Headers.Add("Content-Type", "text/plain; charset=utf-8");
-                        await resp.WriteStringAsync(validationToken, cancellationToken);
-
-                        _telemetry.TrackEvent("MailNotification_ValidationTokenReturned", new Dictionary<string, string>
+                        if (long.TryParse(contentLengthValues.FirstOrDefault(), out var contentLength))
                         {
-                            { "Token", validationToken },
-                            { "Method", "POST" }
-                        });
+                            if (contentLength > MaxRequestSizeBytes)
+                            {
+                                _logger.LogWarning(
+                                    "⚠️ Request body too large: {Size} bytes (max: {MaxSize} bytes). CorrelationId: {CorrelationId}",
+                                    contentLength,
+                                    MaxRequestSizeBytes,
+                                    correlationId);
 
-                        _logger.LogInformation("✅ Validation token echoed back to Microsoft Graph");
-                        LogEnd(nameof(MailNotificationFunction), new { validationToken, method = "POST" });
-                        return resp;
+                                _telemetry.TrackEvent("MailNotification_RequestTooLarge", new Dictionary<string, string>
+                                {
+                                    { "CorrelationId", correlationId },
+                                    { "RequestSize", contentLength.ToString() },
+                                    { "MaxSize", MaxRequestSizeBytes.ToString() }
+                                });
+
+                                return await BadRequest(req,
+                                    $"Request body too large. Maximum size: {MaxRequestSizeBytes / 1024 / 1024}MB");
+                            }
+                        }
                     }
 
-                    // ✅ Process notification payload  
-                    var rawBody = await new System.IO.StreamReader(req.Body).ReadToEndAsync();
+                    // ✅ Read request body with size limit  
+                    string rawBody;
+                    try
+                    {
+                        using var limitedStream = new LimitedStream(req.Body, MaxRequestSizeBytes);
+                        using var reader = new System.IO.StreamReader(limitedStream);
+                        rawBody = await reader.ReadToEndAsync(cancellationToken);
+                    }
+                    catch (InvalidOperationException ex) when (ex.Message.Contains("exceeded maximum length"))
+                    {
+                        _logger.LogWarning(
+                            ex,
+                            "⚠️ Request body exceeded size limit. CorrelationId: {CorrelationId}",
+                            correlationId);
+
+                        return await BadRequest(req, "Request body too large");
+                    }
+
                     if (string.IsNullOrWhiteSpace(rawBody))
                     {
-                        _logger.LogWarning("⚠️ Empty request body received");
+                        _logger.LogWarning(
+                            "⚠️ Empty request body received. CorrelationId: {CorrelationId}",
+                            correlationId);
+
                         return await BadRequest(req, "Request body is empty");
                     }
 
-                    _logger.LogInformation("📨 Notification payload received. Length={Length}", rawBody.Length);
+                    _logger.LogInformation(
+                        "📨 Notification payload received. Length={Length}, CorrelationId={CorrelationId}",
+                        rawBody.Length,
+                        correlationId);
 
+                    // ✅ Parse JSON payload
                     GraphNotification? payload;
                     try
                     {
                         payload = JsonSerializer.Deserialize<GraphNotification>(
                             rawBody,
-                            new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                            new JsonSerializerOptions
+                            {
+                                PropertyNameCaseInsensitive = true,
+                                MaxDepth = 32,  // ✅ Prevent deeply nested JSON attacks (JSON bomb protection)
+                                AllowTrailingCommas = false,
+                                ReadCommentHandling = JsonCommentHandling.Disallow
+                            });
                     }
                     catch (JsonException jsonEx)
                     {
-                        _logger.LogError(jsonEx, "❌ Failed to deserialize notification payload");
-                        _telemetry.TrackException(jsonEx);
+                        _logger.LogError(
+                            jsonEx,
+                            "❌ Failed to deserialize notification payload. CorrelationId: {CorrelationId}",
+                            correlationId);
+
+                        _telemetry.TrackException(jsonEx, new Dictionary<string, string>
+                        {
+                            { "CorrelationId", correlationId },
+                            { "Operation", "DeserializePayload" }
+                        });
+
                         return await BadRequest(req, "Invalid JSON payload");
                     }
 
                     if (payload?.Value == null || !payload.Value.Any())
                     {
-                        _logger.LogWarning("⚠️ Notification payload contains no items");
+                        _logger.LogWarning(
+                            "⚠️ Notification payload contains no items. CorrelationId: {CorrelationId}",
+                            correlationId);
+
                         return await BadRequest(req, "Notification payload is empty");
                     }
 
-                    var processedCount = 0;
-                    var failedCount = 0;
+                    _logger.LogInformation(
+                        "📦 Processing {Count} notification(s). CorrelationId: {CorrelationId}",
+                        payload.Value.Count,
+                        correlationId);
 
-                    foreach (var item in payload.Value)
+                    // ✅ Process notifications with concurrency limit (max 5 parallel)  
+                    var semaphore = new SemaphoreSlim(5);
+                   
+                    var tasks = payload.Value.Select(async item =>
                     {
+                        await semaphore.WaitAsync(cancellationToken);
                         try
                         {
-                            var success = await _handler.HandleAsync(item, rawBody, cancellationToken);
-                            if (success)
-                                processedCount++;
-                            else
-                                failedCount++;
+                            // ✅ FIXED: Convert GraphNotification.ChangeNotification to NotificationItem  
+                            var notificationItem = item.ToNotificationItem(); // ✅ ADD THIS LINE  
+
+                            // ✅ Client state validation happens inside HandleAsync  
+                            return await _handler.HandleAsync(
+                                notificationItem, // ✅ CHANGED: Pass NotificationItem instead of ChangeNotification  
+                                rawBody,
+                                cancellationToken);
                         }
                         catch (SecurityException secEx)
                         {
-                            _logger.LogError(secEx, "🚨 Security validation failed for notification");
+                            _logger.LogError(
+                                secEx,
+                                "🚨 Client state validation failed for SubscriptionId: {SubscriptionId}. CorrelationId: {CorrelationId}",
+                                item.SubscriptionId,
+                                correlationId);
+
                             _telemetry.TrackException(secEx, new Dictionary<string, string>
                             {
-                                { "SubscriptionId", item.SubscriptionId ?? "unknown" }
+                                { "CorrelationId", correlationId },
+                                { "SubscriptionId", item.SubscriptionId ?? "unknown" },
+                                { "ErrorType", "ClientStateValidationFailed" }
                             });
-                            failedCount++;
 
-                            // ✅ Return 401 for security failures to alert Microsoft Graph  
-                            return await Unauthorized(req, "Client state validation failed");
+                            throw; // Re-throw to fail entire batch (security violation)  
                         }
                         catch (Exception ex)
                         {
-                            _logger.LogError(ex, "❌ Error processing notification item");
-                            _telemetry.TrackException(ex);
-                            failedCount++;
+                            _logger.LogError(
+                                ex,
+                                "❌ Error processing notification item. SubscriptionId: {SubscriptionId}, CorrelationId: {CorrelationId}",
+                                item.SubscriptionId,
+                                correlationId);
+
+                            _telemetry.TrackException(ex, new Dictionary<string, string>
+                            {
+                                { "CorrelationId", correlationId },
+                                { "SubscriptionId", item.SubscriptionId ?? "unknown" }
+                            });
+
+                            return false; // Mark as failed but continue processing other notifications  
                         }
+                        finally
+                        {
+                            semaphore.Release();
+                        }
+                    });
+
+                    bool[] results;
+                    try
+                    {
+                        results = await Task.WhenAll(tasks);
+                    }
+                    catch (SecurityException)
+                    {
+                        // ✅ Client state validation failed - return 401 to alert Microsoft Graph  
+                        _logger.LogError(
+                            "🚨 Client state validation failed for one or more notifications. " +
+                            "Returning 401 to Microsoft Graph. CorrelationId: {CorrelationId}",
+                            correlationId);
+
+                        _telemetry.TrackEvent("MailNotification_SecurityViolation", new Dictionary<string, string>
+                        {
+                            { "CorrelationId", correlationId },
+                            { "NotificationCount", payload.Value.Count.ToString() }
+                        });
+
+                        return await Unauthorized(req, "Client state validation failed. Possible spoofing attempt detected.");
                     }
 
+                    var processedCount = results.Count(r => r);
+                    var failedCount = results.Count(r => !r);
+
                     _logger.LogInformation(
-                        "✅ Notification processing complete. Processed: {Processed}, Failed: {Failed}",
-                        processedCount, failedCount);
+                        "✅ Notification processing complete. " +
+                        "Processed: {Processed}, Failed: {Failed}, Total: {Total}, CorrelationId: {CorrelationId}",
+                        processedCount,
+                        failedCount,
+                        payload.Value.Count,
+                        correlationId);
 
-                    _telemetry.TrackMetric("MailNotifications_Processed", processedCount);
-                    _telemetry.TrackMetric("MailNotifications_Failed", failedCount);
+                    _telemetry.TrackMetric("MailNotifications_Processed", processedCount, new Dictionary<string, string>
+                    {
+                        { "CorrelationId", correlationId }
+                    });
 
+                    _telemetry.TrackMetric("MailNotifications_Failed", failedCount, new Dictionary<string, string>
+                    {
+                        { "CorrelationId", correlationId }
+                    });
+
+                    // ✅ Return success even if some notifications failed (Microsoft Graph expects 2xx for retries)  
                     var ok = req.CreateResponse(HttpStatusCode.OK);
                     await ok.WriteAsJsonAsync(new
                     {
                         message = "Notifications processed successfully.",
                         processed = processedCount,
-                        failed = failedCount
+                        failed = failedCount,
+                        total = payload.Value.Count,
+                        correlationId = correlationId
                     }, cancellationToken: cancellationToken);
 
-                    LogEnd(nameof(MailNotificationFunction), new { processedCount, failedCount });
+                    LogEnd(nameof(MailNotificationFunction), new
+                    {
+                        processedCount,
+                        failedCount,
+                        totalCount = payload.Value.Count,
+                        correlationId
+                    });
+
                     return ok;
                 }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogWarning(
+                        "⚠️ Operation was cancelled. CorrelationId: {CorrelationId}",
+                        correlationId);
 
-                // ✅ Unsupported HTTP method  
-                _logger.LogWarning("⚠️ Unsupported HTTP method: {Method}", req.Method);
-                return await BadRequest(req, $"Unsupported HTTP method: {req.Method}");
-            }
-            catch (OperationCanceledException)
-            {
-                _logger.LogWarning("⚠️ Operation was cancelled");
-                return await InternalServerError(req, "Operation was cancelled");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "❌ Unhandled error in MailNotificationFunction");
-                _telemetry.TrackException(ex);
-                return await InternalServerError(req, "An error occurred while processing notifications.");
+                    return await InternalServerError(req, "Operation was cancelled");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(
+                        ex,
+                        "❌ Unhandled error in MailNotificationFunction. CorrelationId: {CorrelationId}",
+                        correlationId);
+
+                    _telemetry.TrackException(ex, new Dictionary<string, string>
+                    {
+                        { "CorrelationId", correlationId },
+                        { "Operation", "MailNotificationFunction" }
+                    });
+
+                    return await InternalServerError(req, "An error occurred while processing notifications.");
+                }
             }
         }
+    }
+
+    /// <summary>  
+    /// Stream wrapper that enforces maximum read length to prevent DoS attacks.  
+    /// </summary>  
+    public class LimitedStream : System.IO.Stream
+    {
+        private readonly System.IO.Stream _innerStream;
+        private readonly long _maxLength;
+        private long _totalBytesRead;
+
+        public LimitedStream(System.IO.Stream innerStream, long maxLength)
+        {
+            _innerStream = innerStream ?? throw new ArgumentNullException(nameof(innerStream));
+            _maxLength = maxLength;
+        }
+
+        public override async Task<int> ReadAsync(
+            byte[] buffer,
+            int offset,
+            int count,
+            CancellationToken cancellationToken)
+        {
+            var bytesRead = await _innerStream.ReadAsync(buffer, offset, count, cancellationToken);
+            _totalBytesRead += bytesRead;
+
+            if (_totalBytesRead > _maxLength)
+            {
+                throw new InvalidOperationException(
+                    $"Stream exceeded maximum length of {_maxLength} bytes");
+            }
+
+            return bytesRead;
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var bytesRead = _innerStream.Read(buffer, offset, count);
+            _totalBytesRead += bytesRead;
+
+            if (_totalBytesRead > _maxLength)
+            {
+                throw new InvalidOperationException(
+                    $"Stream exceeded maximum length of {_maxLength} bytes");
+            }
+
+            return bytesRead;
+        }
+
+        // Required Stream overrides  
+        public override bool CanRead => _innerStream.CanRead;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+        public override void Flush() => _innerStream.Flush();
+        public override long Seek(long offset, System.IO.SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 }

@@ -18,6 +18,7 @@ namespace MailNotificationFunctionApp.Services
     /// <remarks>  
     /// Uses connection pooling and implements retry logic for transient failures.  
     /// Connections are thread-safe and reused across multiple publish operations.  
+    /// Assumes queue is pre-configured and managed by infrastructure.  
     /// </remarks>  
     public class RabbitMqPublisher : IMessageQueuePublisher, IDisposable
     {
@@ -25,7 +26,8 @@ namespace MailNotificationFunctionApp.Services
         private readonly ILogger<RabbitMqPublisher> _logger;
         private readonly ICustomTelemetry _telemetry;
         private IConnection? _connection;
-        private IChannel? _channel; // ✅ Changed from IModel to IChannel  
+        private IChannel? _channel;
+
         private readonly SemaphoreSlim _lock = new SemaphoreSlim(1, 1);
         private bool _disposed = false;
 
@@ -38,8 +40,8 @@ namespace MailNotificationFunctionApp.Services
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _telemetry = telemetry ?? throw new ArgumentNullException(nameof(telemetry));
 
-            // ✅ Initialize synchronously in constructor  
-            InitializeConnectionAsync().GetAwaiter().GetResult();
+            // ✅ REMOVED blocking call - Connection will be initialized lazily on first use
+            // This prevents potential deadlocks and thread pool starvation during startup
         }
 
         /// <summary>  
@@ -62,38 +64,60 @@ namespace MailNotificationFunctionApp.Services
                     TopologyRecoveryEnabled = true
                 };
 
-                // ✅ Use async methods  
+                // Create connection and channel  
                 _connection = await factory.CreateConnectionAsync();
                 _channel = await _connection.CreateChannelAsync();
 
-                // Declare exchange (idempotent)  
+                // ✅ Only declare exchange (idempotent)  
                 await _channel.ExchangeDeclareAsync(
                     exchange: _config.ExchangeName,
                     type: ExchangeType.Topic,
                     durable: _config.Durable,
                     autoDelete: false);
 
-                // Declare queue (idempotent)  
-                await _channel.QueueDeclareAsync(
-                    queue: _config.QueueName,
-                    durable: _config.Durable,
-                    exclusive: false,
-                    autoDelete: false,
-                    arguments: null);
+                // ✅ Verify queue exists without modifying it (optional passive check)  
+                try
+                {
+                    await _channel.QueueDeclarePassiveAsync(_config.QueueName);
+                    _logger.LogInformation(
+                        "✅ Verified queue exists: {QueueName}",
+                        _config.QueueName);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "⚠️ Could not verify queue existence (may not have permissions): {QueueName}. " +
+                        "Assuming queue is managed by infrastructure.",
+                        _config.QueueName);
+                    // Continue anyway - queue might exist but we don't have passive declare permissions  
+                }
 
-                // Bind queue to exchange  
-                await _channel.QueueBindAsync(
-                    queue: _config.QueueName,
-                    exchange: _config.ExchangeName,
-                    routingKey: _config.RoutingKey);
+                // ✅ Don't declare queue - assume it's managed by infrastructure  
+                // ✅ Don't bind queue - assume binding is managed by infrastructure  
 
                 _logger.LogInformation(
-                    "✅ RabbitMQ connection established: {HostName}:{Port}, Queue: {QueueName}",
-                    _config.HostName, _config.Port, _config.QueueName);
+                    "✅ RabbitMQ connection established: {HostName}:{Port}, Exchange: {ExchangeName}, Queue: {QueueName}",
+                    _config.HostName, _config.Port, _config.ExchangeName, _config.QueueName);
+
+                _telemetry.TrackEvent("RabbitMQ_ConnectionInitialized", new Dictionary<string, string>
+                {
+                    { "HostName", _config.HostName },
+                    { "Port", _config.Port.ToString() },
+                    { "ExchangeName", _config.ExchangeName },
+                    { "QueueName", _config.QueueName }
+                });
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "❌ Failed to initialize RabbitMQ connection");
+
+                _telemetry.TrackException(ex, new Dictionary<string, string>
+                {
+                    { "Operation", "InitializeConnection" },
+                    { "HostName", _config.HostName },
+                    { "Port", _config.Port.ToString() }
+                });
+
                 throw;
             }
         }
@@ -135,6 +159,8 @@ namespace MailNotificationFunctionApp.Services
                 await _lock.WaitAsync(cancellationToken);
                 try
                 {
+                    // ✅ Publish directly to exchange with routing key  
+                    // The exchange will route to the queue based on bindings  
                     await _channel!.BasicPublishAsync(
                         exchange: _config.ExchangeName,
                         routingKey: _config.RoutingKey,
@@ -149,15 +175,16 @@ namespace MailNotificationFunctionApp.Services
                 }
 
                 _logger.LogInformation(
-                    "📤 Published notification to RabbitMQ: NotificationId={NotificationId}, UserId={UserId}",
-                    message.NotificationId, message.UserId);
+                    "📤 Published notification to RabbitMQ: NotificationId={NotificationId}, UserId={UserId}, RoutingKey={RoutingKey}",
+                    message.NotificationId, message.UserId, _config.RoutingKey);
 
                 _telemetry.TrackEvent("RabbitMQ_MessagePublished", new Dictionary<string, string>
                 {
                     { "NotificationId", message.NotificationId },
                     { "UserId", message.UserId },
                     { "MessageId", message.MessageId },
-                    { "QueueName", _config.QueueName }
+                    { "ExchangeName", _config.ExchangeName },
+                    { "RoutingKey", _config.RoutingKey }
                 });
 
                 return true;
@@ -171,7 +198,9 @@ namespace MailNotificationFunctionApp.Services
                 _telemetry.TrackException(ex, new Dictionary<string, string>
                 {
                     { "NotificationId", message.NotificationId },
-                    { "Operation", "PublishNotification" }
+                    { "Operation", "PublishNotification" },
+                    { "ExchangeName", _config.ExchangeName },
+                    { "RoutingKey", _config.RoutingKey }
                 });
 
                 return false;
@@ -184,10 +213,17 @@ namespace MailNotificationFunctionApp.Services
             try
             {
                 var isHealthy = _connection?.IsOpen == true && _channel?.IsOpen == true;
+
+                if (!isHealthy)
+                {
+                    _logger.LogWarning("⚠️ RabbitMQ health check failed: Connection or channel is closed");
+                }
+
                 return Task.FromResult(isHealthy);
             }
-            catch
+            catch (Exception ex)
             {
+                _logger.LogError(ex, "❌ RabbitMQ health check exception");
                 return Task.FromResult(false);
             }
         }
@@ -209,6 +245,8 @@ namespace MailNotificationFunctionApp.Services
                     {
                         await DisposeAsync();
                         await InitializeConnectionAsync();
+
+                        _logger.LogInformation("✅ RabbitMQ reconnection successful");
                     }
                 }
                 finally

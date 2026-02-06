@@ -17,8 +17,10 @@ namespace MailNotificationFunctionApp.Middleware
     /// Skips authentication for:  
     /// <list type="bullet">  
     ///     <item>Swagger/OpenAPI documentation endpoints</item>  
-    ///     <item>Microsoft Graph webhook validation requests (with validationToken query parameter)</item>  
+    ///     <item>Microsoft Graph webhook requests (validation and notifications)</item>  
     /// </list>  
+    /// Note: Microsoft Graph notifications are authenticated via client state validation in the handler,  
+    /// not via API key headers.  
     /// </summary>  
     public class ApiKeyAuthMiddleware : IFunctionsWorkerMiddleware
     {
@@ -43,28 +45,26 @@ namespace MailNotificationFunctionApp.Middleware
             }
 
             var path = req.Url.AbsolutePath?.ToLowerInvariant() ?? string.Empty;
+            var method = req.Method?.ToUpperInvariant() ?? string.Empty;
 
-            // ✅ CRITICAL: Bypass API key validation for Microsoft Graph webhook validation  
-            // Microsoft Graph sends GET requests with ?validationToken parameter during subscription creation  
-            // These requests do NOT include custom headers like x-api-key  
-            var query = req.Url.Query;
-            if (!string.IsNullOrEmpty(query))
+            // ✅ CRITICAL: Bypass API key validation for Microsoft Graph webhook endpoint ONLY
+            // Microsoft Graph sends:
+            // 1. GET /notifications?validationToken=xyz (validation)
+            // 2. POST /notifications (actual change notifications)
+            // Neither includes custom headers like x-api-key
+            // Security is provided by client state validation in the notification handler
+            if (IsGraphWebhookEndpoint(path, method))
             {
-                var validationToken = System.Web.HttpUtility.ParseQueryString(query)["validationToken"];
-                if (!string.IsNullOrEmpty(validationToken))
-                {
-                    _logger.LogInformation(
-                        "🔓 Bypassing API key check for Microsoft Graph validation request. Token: {Token}",
-                        validationToken);
-                    await next(context);
-                    return;
-                }
+                _logger.LogInformation(
+                    "🔓 Bypassing API key check for Microsoft Graph webhook endpoint. Method: {Method}, Path: {Path}",
+                    method,
+                    path);
+                await next(context);
+                return;
             }
 
-            // ✅ Skip authentication for Swagger/OpenAPI endpoints  
-            if (path.Contains("swagger", StringComparison.OrdinalIgnoreCase) ||
-                path.Contains("openapi", StringComparison.OrdinalIgnoreCase) ||
-                path.Contains("oauth2-redirect", StringComparison.OrdinalIgnoreCase))
+            // ✅ Skip authentication for Swagger/OpenAPI endpoints
+            if (IsDocumentationEndpoint(path))
             {
                 _logger.LogDebug("Skipping API key authentication for documentation endpoint: {Path}", path);
                 await next(context);
@@ -95,7 +95,7 @@ namespace MailNotificationFunctionApp.Middleware
             // ✅ Check if header exists  
             if (!req.Headers.TryGetValues("x-api-key", out var apiKeyHeaders))
             {
-                _logger.LogWarning("❌ Missing x-api-key header.");
+                _logger.LogWarning("❌ Missing x-api-key header. Path: {Path}", path);
                 await WriteUnauthorizedAsync(context, "Missing x-api-key header");
                 return;
             }
@@ -106,13 +106,46 @@ namespace MailNotificationFunctionApp.Middleware
             // ✅ Compare keys (case-insensitive, trimmed)  
             if (!string.Equals(providedKey, expectedKeyTrimmed, StringComparison.OrdinalIgnoreCase))
             {
-                _logger.LogWarning("❌ Invalid API key provided.");
+                _logger.LogWarning("❌ Invalid API key provided. Path: {Path}", path);
                 await WriteUnauthorizedAsync(context, "Invalid API key");
                 return;
             }
 
-            _logger.LogInformation("✅ API Key authentication succeeded.");
+            _logger.LogInformation("✅ API Key authentication succeeded. Path: {Path}", path);
             await next(context);
+        }
+
+        /// <summary>
+        /// Determines if the request is from Microsoft Graph webhook (validation or notification).
+        /// </summary>
+        /// <remarks>
+        /// Microsoft Graph requires anonymous access because:
+        /// 1. Subscription validation uses GET with validationToken query parameter
+        /// 2. Webhook notifications use POST without custom headers
+        /// 3. Security is enforced via client state validation in NotificationHandler
+        /// </remarks>
+        private static bool IsGraphWebhookEndpoint(string path, string method)
+        {
+            // Only bypass the exact /api/notifications endpoint (not sub-paths like /api/notifications/stats)
+            // Accept both GET (validation) and POST (notifications)
+
+            // Check for route prefix from host.json
+            var isExactMatch = path.Equals("/api/notifications", StringComparison.OrdinalIgnoreCase) ||
+                              path.Equals("/service/mailnotificationfunction/api/notifications", StringComparison.OrdinalIgnoreCase);
+
+            var isGetOrPost = method == "GET" || method == "POST";
+
+            return isExactMatch && isGetOrPost;
+        }
+
+        /// <summary>
+        /// Determines if the request is for API documentation.
+        /// </summary>
+        private static bool IsDocumentationEndpoint(string path)
+        {
+            return path.Contains("swagger", StringComparison.OrdinalIgnoreCase) ||
+                   path.Contains("openapi", StringComparison.OrdinalIgnoreCase) ||
+                   path.Contains("oauth2-redirect", StringComparison.OrdinalIgnoreCase);
         }
 
         private static async Task WriteUnauthorizedAsync(FunctionContext context, string message)

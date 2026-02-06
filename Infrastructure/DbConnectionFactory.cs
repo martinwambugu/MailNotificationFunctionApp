@@ -1,5 +1,4 @@
 ﻿using System;
-using System.Data;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
@@ -25,7 +24,6 @@ namespace MailNotificationFunctionApp.Infrastructure
             _logger = logger;
 
             var connectionString = configuration.GetConnectionString("PostgreSqlConnection");
-
             if (string.IsNullOrWhiteSpace(connectionString))
             {
                 _logger.LogError("❌ Database connection string 'PostgreSqlConnection' is not configured.");
@@ -34,7 +32,7 @@ namespace MailNotificationFunctionApp.Infrastructure
                     "Please set it in appsettings.json, local.settings.json, or Azure Key Vault.");
             }
 
-            // ✅ Configure connection pooling  
+            // ✅ Configure connection pooling
             var builder = new NpgsqlConnectionStringBuilder(connectionString)
             {
                 Pooling = true,
@@ -44,33 +42,27 @@ namespace MailNotificationFunctionApp.Infrastructure
                 ConnectionPruningInterval = 10,
                 CommandTimeout = 30,
                 Timeout = 15,
-                NoResetOnClose = true,
+                NoResetOnClose = false,  // ✅ SAFE: Always reset connection state on return to pool (prevents transaction state leakage)
                 MaxAutoPrepare = 20,
                 AutoPrepareMinUsages = 2,
-                //KeepAlive = 30,
-                //TcpKeepAlive = true,
-                //TcpKeepAliveInterval = 10,
-                SslMode = SslMode.Require,
-                TrustServerCertificate = false // ✅ Validate certificates in production  
+                SslMode = SslMode.Require
+                // TrustServerCertificate removed - obsolete in Npgsql 10.0+
             };
 
             _connectionString = builder.ToString();
 
-            // ✅ Log sanitized connection string  
             var safeConnString = $"Host={builder.Host};Port={builder.Port};Database={builder.Database};" +
                                 $"Username={builder.Username};Password=****;Pooling={builder.Pooling};" +
                                 $"MinPoolSize={builder.MinPoolSize};MaxPoolSize={builder.MaxPoolSize}";
-
             _logger.LogInformation("📡 PostgreSQL connection factory initialized: {ConnectionString}", safeConnString);
         }
 
         /// <inheritdoc/>  
-        public async Task<IDbConnection> CreateConnectionAsync(CancellationToken cancellationToken = default)
+        public async Task<NpgsqlConnection> CreateConnectionAsync(CancellationToken cancellationToken = default)
         {
             _logger.LogDebug("Creating new PostgreSQL connection from pool...");
 
             NpgsqlConnection? connection = null;
-
             try
             {
                 connection = new NpgsqlConnection(_connectionString);
