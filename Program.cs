@@ -1,4 +1,4 @@
-﻿using Azure.Monitor.OpenTelemetry.Exporter;
+using Azure.Monitor.OpenTelemetry.Exporter;
 using MailNotificationFunctionApp.Infrastructure;
 using MailNotificationFunctionApp.Interfaces;
 using MailNotificationFunctionApp.Middleware;
@@ -148,6 +148,10 @@ var host = new HostBuilder()
         // ✅ FIXED: Register RabbitMQ configuration using context.Configuration  
         builder.Services.Configure<RabbitMqConfiguration>(
             context.Configuration.GetSection("RabbitMq"));
+
+        // ✅ Register subscription validation configuration (grace period, diagnostics)
+        builder.Services.Configure<SubscriptionValidationConfiguration>(
+            context.Configuration.GetSection("SubscriptionValidation"));
 
         // ✅ Register RabbitMQ publisher as singleton (connection pooling)  
         builder.Services.AddSingleton<IMessageQueuePublisher, RabbitMqPublisher>();

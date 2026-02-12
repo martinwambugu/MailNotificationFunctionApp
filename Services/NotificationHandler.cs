@@ -1,9 +1,11 @@
-﻿using MailNotificationFunctionApp.Interfaces;
+using MailNotificationFunctionApp.Interfaces;
 using MailNotificationFunctionApp.Models;
 using MailNotificationFunctionApp.Extensions; // ✅ ADD THIS  
 using Dapper;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Npgsql;
 using System;
 using System.Collections.Generic;
 using System.Security;
@@ -32,6 +34,7 @@ namespace MailNotificationFunctionApp.Services
         private readonly ILogger<NotificationHandler> _logger;
         private readonly ICustomTelemetry _telemetry;
         private readonly IMessageQueuePublisher _queuePublisher;
+        private readonly SubscriptionValidationConfiguration _validationConfig;
 
         /// <summary>  
         /// Initializes a new instance of the <see cref="NotificationHandler"/> class.  
@@ -42,7 +45,8 @@ namespace MailNotificationFunctionApp.Services
             IConfiguration config,
             ILogger<NotificationHandler> logger,
             ICustomTelemetry telemetry,
-            IMessageQueuePublisher queuePublisher)
+            IMessageQueuePublisher queuePublisher,
+            IOptions<SubscriptionValidationConfiguration> validationOptions)
         {
             _repo = repo ?? throw new ArgumentNullException(nameof(repo));
             _dbFactory = dbFactory ?? throw new ArgumentNullException(nameof(dbFactory));
@@ -50,6 +54,9 @@ namespace MailNotificationFunctionApp.Services
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _telemetry = telemetry ?? throw new ArgumentNullException(nameof(telemetry));
             _queuePublisher = queuePublisher ?? throw new ArgumentNullException(nameof(queuePublisher));
+
+            if (validationOptions == null) throw new ArgumentNullException(nameof(validationOptions));
+            _validationConfig = validationOptions.Value ?? new SubscriptionValidationConfiguration();
         }
 
         /// <inheritdoc/>  
@@ -314,10 +321,9 @@ namespace MailNotificationFunctionApp.Services
             try
             {
                 const string sql = @"  
-                    SELECT clientstate  
+                    SELECT subscriptionid, subscriptionexpirationtime, clientstate  
                     FROM mailsubscriptions  
-                    WHERE subscriptionid = @SubscriptionId  
-                    AND subscriptionexpirationtime > NOW();";
+                    WHERE subscriptionid = @SubscriptionId;";
 
                 using var conn = await _dbFactory.CreateConnectionAsync(cancellationToken);
 
@@ -325,16 +331,120 @@ namespace MailNotificationFunctionApp.Services
                     sql,
                     new { SubscriptionId = notification.SubscriptionId },
                     cancellationToken: cancellationToken,
-                    commandTimeout: 10
-                );
+                    commandTimeout: 30);
 
-                var expectedClientState = await conn.QuerySingleOrDefaultAsync<string>(command);
+                SubscriptionValidationRow? subscription = null;
+                try
+                {
+                    subscription = await conn.QuerySingleOrDefaultAsync<SubscriptionValidationRow>(command);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    _logger.LogError(
+                        "❌ Database query cancelled (timeout or cancellation) for SubscriptionId: {SubscriptionId}",
+                        notification.SubscriptionId);
+                    return false;
+                }
+                catch (NpgsqlException dbEx) when (
+                    dbEx.InnerException is TimeoutException ||
+                    dbEx.Message.Contains("timeout", StringComparison.OrdinalIgnoreCase) ||
+                    dbEx.Message.Contains("cancelled", StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.LogError(
+                        dbEx,
+                        "❌ Database query timeout for SubscriptionId: {SubscriptionId}. " +
+                        "This may indicate database performance issues or connection pool exhaustion.",
+                        notification.SubscriptionId);
+                    return false;
+                }
+
+                if (subscription is null)
+                {
+                    _logger.LogWarning(
+                        "⚠️ Subscription not found in database: {SubscriptionId}",
+                        notification.SubscriptionId);
+
+                    _telemetry.TrackEvent("MailNotification_SubscriptionNotFound", new Dictionary<string, string>
+                    {
+                        { "SubscriptionId", notification.SubscriptionId },
+                        { "Reason", "NotFound" }
+                    });
+
+                    return false;
+                }
+
+                var nowUtc = DateTime.UtcNow;
+                var expiration = subscription.SubscriptionExpirationTime;
+                var graceMinutes = _validationConfig.ExpirationGracePeriodMinutes;
+                var allowExpiredWithinGrace = _validationConfig.AllowExpiredWithinGracePeriod;
+                var threshold = graceMinutes > 0
+                    ? nowUtc.AddMinutes(-graceMinutes)
+                    : nowUtc;
+
+                var isWithinValidityWindow = expiration > threshold;
+
+                if (!isWithinValidityWindow)
+                {
+                    var timeSinceExpiry = nowUtc - expiration;
+
+                    _logger.LogWarning(
+                        "⚠️ Subscription expired and outside grace period. SubscriptionId: {SubscriptionId}, " +
+                        "ExpiredAtUtc: {ExpiredAtUtc:O}, NowUtc: {NowUtc:O}, TimeSinceExpiry: {TimeSinceExpiry}",
+                        notification.SubscriptionId,
+                        expiration,
+                        nowUtc,
+                        timeSinceExpiry);
+
+                    _telemetry.TrackEvent("MailNotification_SubscriptionExpired", new Dictionary<string, string>
+                    {
+                        { "SubscriptionId", notification.SubscriptionId },
+                        { "ExpiredAtUtc", expiration.ToString("O") },
+                        { "NowUtc", nowUtc.ToString("O") },
+                        { "TimeSinceExpiry", timeSinceExpiry.ToString() }
+                    });
+
+                    return false;
+                }
+
+                // If we get here, the subscription is either not expired or within grace period
+                if (expiration <= nowUtc && expiration > threshold && allowExpiredWithinGrace)
+                {
+                    var timeSinceExpiry = nowUtc - expiration;
+
+                    _logger.LogInformation(
+                        "ℹ️ Subscription expired but within grace period. Accepting notification. " +
+                        "SubscriptionId: {SubscriptionId}, ExpiredAtUtc: {ExpiredAtUtc:O}, NowUtc: {NowUtc:O}, " +
+                        "TimeSinceExpiry: {TimeSinceExpiry}, GraceMinutes: {GraceMinutes}",
+                        notification.SubscriptionId,
+                        expiration,
+                        nowUtc,
+                        timeSinceExpiry,
+                        graceMinutes);
+
+                    _telemetry.TrackEvent("MailNotification_SubscriptionExpiredWithinGracePeriod", new Dictionary<string, string>
+                    {
+                        { "SubscriptionId", notification.SubscriptionId },
+                        { "ExpiredAtUtc", expiration.ToString("O") },
+                        { "NowUtc", nowUtc.ToString("O") },
+                        { "TimeSinceExpiry", timeSinceExpiry.ToString() },
+                        { "GraceMinutes", graceMinutes.ToString() }
+                    });
+                }
+
+                var expectedClientState = subscription.ClientState;
 
                 if (string.IsNullOrWhiteSpace(expectedClientState))
                 {
                     _logger.LogWarning(
-                        "⚠️ Subscription not found or expired: {SubscriptionId}",
+                        "⚠️ Subscription record has empty client state: {SubscriptionId}",
                         notification.SubscriptionId);
+
+                    _telemetry.TrackEvent("MailNotification_SubscriptionInvalid", new Dictionary<string, string>
+                    {
+                        { "SubscriptionId", notification.SubscriptionId },
+                        { "Reason", "EmptyClientState" }
+                    });
+
                     return false;
                 }
 
@@ -345,16 +455,45 @@ namespace MailNotificationFunctionApp.Services
                     _logger.LogWarning(
                         "🚨 Client state mismatch for SubscriptionId: {SubscriptionId}",
                         notification.SubscriptionId);
+
+                    _telemetry.TrackEvent("MailNotification_SubscriptionClientStateMismatch", new Dictionary<string, string>
+                    {
+                        { "SubscriptionId", notification.SubscriptionId }
+                    });
                 }
 
                 return isValid;
             }
-            catch (Exception ex)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 _logger.LogError(
-                    ex,
-                    "❌ Error validating client state for SubscriptionId: {SubscriptionId}",
+                    "❌ Client state validation cancelled (timeout) for SubscriptionId: {SubscriptionId}",
                     notification.SubscriptionId);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                // Better error classification to distinguish timeout vs other errors
+                var isTimeout = ex is TimeoutException ||
+                               ex.InnerException is TimeoutException ||
+                               ex.Message.Contains("timeout", StringComparison.OrdinalIgnoreCase) ||
+                               ex.Message.Contains("cancelled", StringComparison.OrdinalIgnoreCase);
+
+                if (isTimeout)
+                {
+                    _logger.LogError(
+                        ex,
+                        "❌ Database timeout during client state validation for SubscriptionId: {SubscriptionId}. " +
+                        "This may indicate database performance issues, missing indexes, or connection pool exhaustion.",
+                        notification.SubscriptionId);
+                }
+                else
+                {
+                    _logger.LogError(
+                        ex,
+                        "❌ Error validating client state for SubscriptionId: {SubscriptionId}",
+                        notification.SubscriptionId);
+                }
                 return false;
             }
         }
@@ -377,6 +516,16 @@ namespace MailNotificationFunctionApp.Services
             }
 
             return result == 0;
+        }
+
+        /// <summary>
+        /// Lightweight DTO used for subscription validation query.
+        /// </summary>
+        private sealed class SubscriptionValidationRow
+        {
+            public string SubscriptionId { get; set; } = string.Empty;
+            public DateTime SubscriptionExpirationTime { get; set; }
+            public string ClientState { get; set; } = string.Empty;
         }
     }
 }

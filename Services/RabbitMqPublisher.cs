@@ -1,4 +1,4 @@
-﻿using MailNotificationFunctionApp.Interfaces;
+using MailNotificationFunctionApp.Interfaces;
 using MailNotificationFunctionApp.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -129,6 +129,13 @@ namespace MailNotificationFunctionApp.Services
         {
             ArgumentNullException.ThrowIfNull(message);
 
+            // ✅ FIXED: Check if disposed before attempting any operations
+            if (_disposed)
+            {
+                _logger.LogError("❌ Cannot publish notification - RabbitMqPublisher has been disposed");
+                return false;
+            }
+
             try
             {
                 await EnsureConnectionIsOpenAsync(cancellationToken);
@@ -233,6 +240,11 @@ namespace MailNotificationFunctionApp.Services
         /// </summary>  
         private async Task EnsureConnectionIsOpenAsync(CancellationToken cancellationToken)
         {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(RabbitMqPublisher), "RabbitMqPublisher has been disposed");
+            }
+
             if (_connection?.IsOpen != true || _channel?.IsOpen != true)
             {
                 _logger.LogWarning("⚠️ RabbitMQ connection closed, reconnecting...");
@@ -243,7 +255,13 @@ namespace MailNotificationFunctionApp.Services
                     // Double-check after acquiring lock  
                     if (_connection?.IsOpen != true || _channel?.IsOpen != true)
                     {
-                        await DisposeAsync();
+                        // ✅ FIXED: Dispose only connection/channel, NOT the lock
+                        // The lock must remain available for reconnection
+                        await DisposeConnectionsOnlyAsync();
+                        
+                        // ✅ FIXED: Reset disposed flag when reinitializing
+                        _disposed = false;
+                        
                         await InitializeConnectionAsync();
 
                         _logger.LogInformation("✅ RabbitMQ reconnection successful");
@@ -253,6 +271,54 @@ namespace MailNotificationFunctionApp.Services
                 {
                     _lock.Release();
                 }
+            }
+        }
+
+        /// <summary>  
+        /// Disposes only the RabbitMQ connections (not the lock).  
+        /// Used during reconnection to clean up old connections.  
+        /// </summary>  
+        private async Task DisposeConnectionsOnlyAsync()
+        {
+            try
+            {
+                if (_channel != null)
+                {
+                    try
+                    {
+                        await _channel.CloseAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "⚠️ Error closing RabbitMQ channel during reconnection");
+                    }
+                    finally
+                    {
+                        _channel?.Dispose();
+                        _channel = null;
+                    }
+                }
+
+                if (_connection != null)
+                {
+                    try
+                    {
+                        await _connection.CloseAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "⚠️ Error closing RabbitMQ connection during reconnection");
+                    }
+                    finally
+                    {
+                        _connection?.Dispose();
+                        _connection = null;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Error disposing RabbitMQ connections during reconnection");
             }
         }
 
@@ -271,18 +337,11 @@ namespace MailNotificationFunctionApp.Services
 
             try
             {
-                if (_channel != null)
-                {
-                    await _channel.CloseAsync();
-                    _channel.Dispose();
-                }
+                // Dispose connections first
+                await DisposeConnectionsOnlyAsync();
 
-                if (_connection != null)
-                {
-                    await _connection.CloseAsync();
-                    _connection.Dispose();
-                }
-
+                // ✅ FIXED: Only dispose lock when the entire service is being disposed
+                // (not during reconnection)
                 _lock?.Dispose();
 
                 _logger.LogInformation("🔌 RabbitMQ connection disposed");
